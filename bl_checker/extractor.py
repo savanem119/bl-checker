@@ -61,12 +61,12 @@ RUBRIQUE_KEYWORDS = {
     "PLACE_DELIVERY": ["place of delivery", "final place"],
     "BL_NUMBER":      ["bill of lading number", "b/l number"],
     "BOOKING":        ["booking"],
-    "HS_CODE":        ["hs code", "hs:", "tariff"],
+    "HS_CODE":        ["hs code", "hs:", "harmonized"],
     "DECLARATION":    ["declaration", "d6/", "e 3"],
     "OT_NUMBER":      ["ot:", "numéro ot", "ot number"],
-    "DESCRIPTION":    ["description", "goods", "cashew", "bags"],
-    "GROSS_WEIGHT":   ["gross weight", "poids brut"],
-    "NET_WEIGHT":     ["net weight", "poids net"],
+    "DESCRIPTION":    ["description of goods", "nature of goods"],
+    "GROSS_WEIGHT":   ["gross weight", "poids brut", "gros poids"],
+    "NET_WEIGHT":     ["net weight", "poids net", "net weighy"],
     "FREIGHT":        ["freight", "prepaid", "collect", "payable"],
     "SEAL":           ["seal"],
 }
@@ -373,10 +373,43 @@ def _detect_rubrique(group, all_spans, container_number=None):
                 context_candidates.append(sp)
     context_text = " ".join(s.text.strip() for s in context_candidates).strip()
     ctx_low = context_text.lower()
+
+    # -- Priorite 1 : texte du groupe lui-meme (plus fiable que le contexte) --
+    group_text_up = _assemble_group_text(group).upper()
+    group_text_lo = group_text_up.lower()
+
+    # Poids dans le texte du groupe = signal fort
+    if any(k in group_text_up for k in ["KGS", " KG", "GROSS WEIGHT", "NET WEIGHT",
+                                         "POIDS BRUT", "POIDS NET", "NET WEIGHY"]):
+        if any(k in group_text_up for k in ["NET", "POIDS NET", "NET WEIGHY"]):
+            return "NET_WEIGHT", context_text
+        return "GROSS_WEIGHT", context_text
+
+    # Autres keywords dans le groupe
+    for rubrique, keywords in RUBRIQUE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in group_text_lo:
+                return rubrique, group_text_lo
+
+    # -- Priorite 2 : keywords dans le contexte (texte voisin) --
     for rubrique, keywords in RUBRIQUE_KEYWORDS.items():
         for kw in keywords:
             if kw in ctx_low:
+                # HS_CODE et DECLARATION via contexte : valider que le texte du groupe
+                # n'est pas un poids > 99999 (eviter faux positifs)
+                if rubrique in ("HS_CODE", "DECLARATION"):
+                    try:
+                        import re as _re
+                        m = _re.match(r'^[\d\s.,]+$', group_text_up.strip())
+                        if m:
+                            val = float(group_text_up.replace(" ", "").replace(",", "."))
+                            if val > 99999:
+                                continue  # c'est un poids, pas un code/declaration
+                    except Exception:
+                        pass
                 return rubrique, context_text
+
+    # -- Priorite 3 : position verticale sur la page --
     page_h = 841
     rel_y = bbox[1] / page_h
     if rel_y < 0.15:
@@ -385,22 +418,19 @@ def _detect_rubrique(group, all_spans, container_number=None):
         return "CONSIGNEE", context_text
     elif rel_y < 0.42:
         return "NOTIFY_PARTY", context_text
-    text = _assemble_group_text(group).upper()
-    if any(k in text for k in ["KGS", "KG", "WEIGHT"]):
-        if "NET" in ctx_low or "NET" in text:
-            return "NET_WEIGHT", context_text
-        return "GROSS_WEIGHT", context_text
-    if any(k in text for k in ["BAGS", "SACS"]):
+
+    # -- Priorite 4 : fallbacks sur le texte du groupe --
+    if any(k in group_text_up for k in ["BAGS", "SACS"]):
         return "NB_SACS", context_text
-    if any(k in text for k in ["HS CODE", "HS:", "08013"]):
+    if any(k in group_text_up for k in ["HS CODE", "HS:", "08013"]):
         return "HS_CODE", context_text
-    if any(k in text for k in ["DECLARATION", "E 3", "D6"]):
+    if any(k in group_text_up for k in ["DECLARATION", "E 3", "D6"]):
         return "DECLARATION", context_text
-    if any(k in text for k in ["OT:", "OT "]):
+    if any(k in group_text_up for k in ["OT:", "OT "]):
         return "OT_NUMBER", context_text
-    if any(k in text for k in ["FREIGHT", "PREPAID", "COLLECT"]):
+    if any(k in group_text_up for k in ["FREIGHT", "PREPAID", "COLLECT"]):
         return "FREIGHT", context_text
-    if any(k in text for k in ["SEAL"]):
+    if any(k in group_text_up for k in ["SEAL"]):
         return "SEAL", context_text
     return "INCONNU", context_text
 
@@ -447,7 +477,22 @@ def _build_corrections(struck_groups, red_groups, all_spans, page_num):
         x_gap = max(0.0, max(bs[0], br[0]) - min(bs[2], br[2]))
         return x_gap < 150
 
+    # Textes boilerplate a ignorer (en-tetes/pieds de tableau, mentions legales)
+    _BOILERPLATE = [
+        "container and seals", "of packages", "signed for the shipper",
+        "applicable only when", "shipper's load", "stow and count",
+        "said to contain", "___________", "b/l no.", "original",
+        "cargo", "description of goods", "no. of packages",
+    ]
+
+    def _is_boilerplate(txt):
+        t = txt.lower().strip()
+        return any(b in t for b in _BOILERPLATE) and len(t) < 80
+
     for g_struck in struck_groups:
+        # Ignorer les boilerplate
+        if _is_boilerplate(_assemble_group_text(g_struck)):
+            continue
         matched_red = None
         best_dist = float("inf")
         for i, g_red in enumerate(red_groups):
@@ -902,52 +947,31 @@ def extract_new_bl_fields(path: str) -> BLFields:
                 break
         if capture and not ll and len(desc_lines) > 2:
             break
-    fields.description = " ".join(desc_lines).strip()[:400]
-
-    # Freight
-    freight_m = re.search(
-        r'(FREIGHT\s+(?:PREPAID|COLLECT|PAYABLE\s+(?:AT\s+[A-Z ]+|BY\s+[A-Z ]+)))',
-        full_text, re.IGNORECASE)
-    if freight_m:
-        fields.freight_terms = freight_m.group(1).strip()
-
-    # Parties commerciales : extraction spatiale (robuste pour CMA CGM)
-    doc_new = fitz.open(str(path))
-    # Chercher la page qui contient les labels SHIPPER/CONSIGNEE/NOTIFY
-    parties = {}
-    for pn in range(doc_new.page_count):
-        p = _extract_parties_spatial(doc_new, pn)
-        if p.get("SHIPPER") or p.get("CONSIGNEE"):
-            parties = p
-            break
-    doc_new.close()
-
-    # Fallback : extraction lineaire si spatial vide
-    if not parties.get("SHIPPER"):
-        parties["SHIPPER"] = _extract_party_block(
-            full_text, "Shipper",
-            ["Consignee", "Notify", "Vessel", "Port of Loading"])
-    if not parties.get("CONSIGNEE"):
-        parties["CONSIGNEE"] = _extract_party_block(
-            full_text, "Consignee",
-            ["Notify", "Vessel", "Port of Loading", "Also notify"])
-    if not parties.get("NOTIFY_PARTY"):
-        parties["NOTIFY_PARTY"] = _extract_party_block(
-            full_text, "Notify",
-            ["Vessel", "Port of Loading", "Booking", "B/L"])
-
-    fields.shipper     = parties.get("SHIPPER", "")
-    fields.consignee   = parties.get("CONSIGNEE", "")
-    fields.notify_party = parties.get("NOTIFY_PARTY", "")
+    if desc_lines:
+        fields.description = " ".join(desc_lines[:4])
 
     # Conteneurs
     fields.containers = _parse_container_table(pages_text)
 
-    if not fields.containers:
-        fields.warnings.append("Aucun conteneur detecte.")
-    if not fields.gross_weight:
-        fields.warnings.append("Poids brut global non detecte.")
-    if not fields.hs_code:
-        fields.warnings.append("HS Code non detecte.")
+    # Parties commerciales (spatial, puis regex de secours)
+    doc2 = fitz.open(str(path))
+    try:
+        parties = _extract_parties_spatial(doc2, page_num=0)
+    finally:
+        doc2.close()
+
+    fields.shipper   = parties.get("SHIPPER", "")
+    fields.consignee = parties.get("CONSIGNEE", "")
+    fields.notify    = parties.get("NOTIFY_PARTY", "")
+
+    # Fallback regex si spatial n'a rien trouve
+    if not fields.shipper:
+        m = re.search(r'SHIPPER[:\s]*\n([^\n]+)', full_text, re.IGNORECASE)
+        if m:
+            fields.shipper = m.group(1).strip()
+    if not fields.consignee:
+        m = re.search(r'CONSIGNEE[:\s]*\n([^\n]+)', full_text, re.IGNORECASE)
+        if m:
+            fields.consignee = m.group(1).strip()
 
     return fields
